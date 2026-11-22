@@ -225,27 +225,45 @@ export function parseFrontMatter(text) {
 // (a regex, reset before every exec, so the recursion cannot corrupt it).
 const INLINE_RE = /[\\`*\[&<>"']/g;
 
+/** True if s[from..to) contains any inline special char. Uses test() (no
+ * match-object allocation) instead of exec(); inlineInto resets lastIndex
+ * before every exec, so the mutation here is harmless. */
+function hasSpecial(s, from, to) {
+  INLINE_RE.lastIndex = from;
+  if (!INLINE_RE.test(s)) return false;
+  return INLINE_RE.lastIndex - 1 < to;
+}
+
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
-function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
-    if (s.startsWith(what, j)) return j;
+function findUnescaped(s, what, from, to) {
+  // indexOf for the candidate, then the escape test: the occurrence is
+  // escaped exactly when the run of backslashes right before it is odd
+  // (the reference scan consumes backslash+escapable pairs left to right).
+  let j = from;
+  for (;;) {
+    const k = s.indexOf(what, j);
+    if (k === -1 || k + what.length > to) return -1;
+    let b = 0;
+    while (k - 1 - b >= from && s[k - 1 - b] === '\\') b++;
+    if (b % 2 === 1) { j = k + 1; continue; }
+    return k;
   }
-  return -1;
 }
 
 /** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
-function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
-    if (c !== '*') continue;
-    if (s[j + 1] === '*') { j++; continue; }
-    return j;
+function findSingleStar(s, from, to) {
+  let j = from;
+  for (;;) {
+    const k = s.indexOf('*', j);
+    if (k === -1 || k >= to) return -1;
+    let b = 0;
+    while (k - 1 - b >= from && s[k - 1 - b] === '\\') b++;
+    if (b % 2 === 1) { j = k + 1; continue; }
+    if (k + 1 < to && s[k + 1] === '*') { j = k + 2; continue; }
+    return k;
   }
-  return -1;
 }
 
 /**
@@ -254,16 +272,19 @@ function findSingleStar(s, from) {
  * inline constructs are handled one by one. Identical output to the
  * reference's recursive inline().
  */
-function inlineInto(s, env, out) {
-  let i = 0;
-  const n = s.length;
-  while (i < n) {
+function inlineInto(s, from, to, env, out) {
+  // Range-based: renders s[from..to) without slicing it for recursion.
+  // Every boundary check is against `to`, so a construct never reads past
+  // the range (the original worked on a sliced copy, where the range end
+  // was the string end).
+  let i = from;
+  while (i < to) {
     // the next plain run (no special char), found by the native regex
     INLINE_RE.lastIndex = i;
     const m = INLINE_RE.exec(s);
-    const next = m ? m.index : n;
+    const next = (m !== null && m.index < to) ? m.index : to;
     if (next > i) out.push(s.slice(i, next));
-    if (next >= n) break;
+    if (next >= to) break;
     i = next;
     const c = s[i];
     if (c === '&') { out.push('&amp;'); i++; }
@@ -272,48 +293,55 @@ function inlineInto(s, env, out) {
     else if (c === '"') { out.push('&quot;'); i++; }
     else if (c === "'") { out.push('&#39;'); i++; }
     else if (c === '\\') {
-      if (i + 1 < n && ESCAPABLE.has(s[i + 1])) {
+      if (i + 1 < to && ESCAPABLE.has(s[i + 1])) {
         const e = s[i + 1];
         out.push(e === '>' ? '&gt;' : e);
         i += 2;
       } else { out.push('\\'); i++; }
     } else if (c === '`') {
       const k = s.indexOf('`', i + 1);
-      if (k > i + 1) {
+      if (k !== -1 && k < to && k > i + 1) {
         out.push('<code>');
         escInto(s, out, i + 1, k);
         out.push('</code>');
         i = k + 1;
       } else { out.push('`'); i++; }
     } else if (c === '*') {
-      if (s[i + 1] === '*') {
-        const k = findUnescaped(s, '**', i + 2);
-        if (k > i + 2) {
+      if (i + 1 < to && s[i + 1] === '*') {
+        const k = findUnescaped(s, '**', i + 2, to);
+        if (k !== -1 && k > i + 2) {
           out.push('<strong>');
-          inlineInto(s.slice(i + 2, k), env, out);
+          if (hasSpecial(s, i + 2, k)) inlineInto(s, i + 2, k, env, out);
+          else out.push(s.slice(i + 2, k));
           out.push('</strong>');
           i = k + 2;
         } else { out.push('**'); i += 2; }
       } else {
-        const k = findSingleStar(s, i + 1);
-        if (k > i + 1) {
+        const k = findSingleStar(s, i + 1, to);
+        if (k !== -1 && k > i + 1) {
           out.push('<em>');
-          inlineInto(s.slice(i + 1, k), env, out);
+          if (hasSpecial(s, i + 1, k)) inlineInto(s, i + 1, k, env, out);
+          else out.push(s.slice(i + 1, k));
           out.push('</em>');
           i = k + 1;
         } else { out.push('*'); i++; }
       }
     } else if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const k = findUnescaped(s, ']', i + 1, to);
+      let m2 = -1;
+      if (k !== -1 && k + 1 < to && s[k + 1] === '(') {
+        const r = s.indexOf(')', k + 2);
+        if (r !== -1 && r < to) m2 = r;
+      }
+      const target = m2 === -1 ? '' : s.slice(k + 2, m2);
       if (target !== '' && !/\s/.test(target)) {
         out.push('<a href="');
         escInto(env.link(target), out);
         out.push('">');
-        inlineInto(s.slice(i + 1, k), env, out);
+        if (hasSpecial(s, i + 1, k)) inlineInto(s, i + 1, k, env, out);
+        else out.push(s.slice(i + 1, k));
         out.push('</a>');
-        i = m + 1;
+        i = m2 + 1;
       } else { out.push('['); i++; }
     }
   }
@@ -322,7 +350,7 @@ function inlineInto(s, env, out) {
 /** `s` rendered inline, as a string. */
 function inlineStr(s, env) {
   const out = [];
-  inlineInto(s, env, out);
+  inlineInto(s, 0, s.length, env, out);
   return out.join('');
 }
 
@@ -517,7 +545,8 @@ export function renderMarkdown(src, env) {
       const parts = [`${open}\n`];
       for (const parts0 of items) {
         parts.push('<li>');
-        inlineInto(parts0.join('\n'), env, parts);
+        const joined = parts0.join('\n');
+        inlineInto(joined, 0, joined.length, env, parts);
         parts.push('</li>\n');
       }
       parts.push(`</${tag}>`);
@@ -532,7 +561,7 @@ export function renderMarkdown(src, env) {
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : blocks.join('\n') + '\n', toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -714,6 +743,97 @@ export function renderNodes(nodes, scope, ctx, depth, out) {
   }
 }
 
+
+// ---------------------------------------------------------------- template compiler
+
+// Compile a parsed template to a function (scope, ctx, depth, out,
+// escInto, textOf, truthy, renderNodes). It renders exactly what
+// renderNodes would, but with includes inlined (the include graph is a
+// DAG), variable paths resolved statically against the enclosing
+// for-scopes, and the node dispatch replaced by straight-line code.
+// A cycle (impossible for generated templates) falls back to the
+// interpreter for that include, so the result stays exact.
+function compileTemplate(name, nodes, templates) {
+  let uid = 0;
+  const parts = ['let __v;'];
+  // frames: [{ scopeVar, names }] — frame 0 is the root scope ('scope').
+  const frames = [{ scopeVar: 'scope', names: new Set() }];
+  const inlining = [name];
+  function resolveFirst(seg) {
+    for (let f = frames.length - 1; f >= 0; f--) {
+      if (frames[f].names.has(seg)) return frames[f].scopeVar;
+    }
+    return 'scope';
+  }
+  // Emit statements resolving `path` into variable `target`, with the
+  // same null/object/hasOwn semantics as lookup().
+  function emitPath(path, target) {
+    const base = resolveFirst(path[0]);
+    parts.push(`${target} = ${base}.vars[${JSON.stringify(path[0])}];`);
+    for (let k = 1; k < path.length; k++) {
+      parts.push(`if (${target} !== null && typeof ${target} === 'object' && Object.hasOwn(${target}, ${JSON.stringify(path[k])})) ${target} = ${target}[${JSON.stringify(path[k])}]; else ${target} = undefined;`);
+    }
+  }
+  function emitNodes(list, staticDepth) {
+    for (const n of list) {
+      if (n.kind === 'text') {
+        parts.push(`out.push(${JSON.stringify(n.text)});`);
+      } else if (n.kind === 'var') {
+        emitPath(n.path, '__v');
+        parts.push(`if (typeof __v === 'string') { if (__v !== '') escInto(__v, out); } else if (__v !== undefined && __v !== null) { const __t = textOf(__v); if (__t !== '') escInto(__t, out); }`);
+      } else if (n.kind === 'raw') {
+        emitPath(n.path, '__v');
+        parts.push(`out.push(textOf(__v));`);
+      } else if (n.kind === 'if') {
+        emitPath(n.path, '__v');
+        parts.push(`if (truthy(__v) !== ${n.not}) {`);
+        emitNodes(n.then, staticDepth);
+        parts.push(`} else {`);
+        if (n.else !== null) emitNodes(n.else, staticDepth);
+        parts.push(`}`);
+      } else if (n.kind === 'for') {
+        const id = ++uid;
+        const xs = `__xs${id}`, lp = `__lp${id}`, sc = `__s${id}`, kk = `__k${id}`;
+        const parentVar = frames[frames.length - 1].scopeVar;
+        parts.push(`let ${xs};`);
+        emitPath(n.path, xs);
+        parts.push(`if (Array.isArray(${xs})) {`);
+        parts.push(`const ${sc} = { vars: {}, parent: ${parentVar} };`);
+        parts.push(`const ${lp} = { index: 0, first: false, last: false, length: ${xs}.length };`);
+        parts.push(`${sc}.vars[${JSON.stringify(n.name)}] = undefined;`);
+        parts.push(`${sc}.vars.loop = ${lp};`);
+        parts.push(`for (let ${kk} = 0; ${kk} < ${xs}.length; ${kk}++) {`);
+        parts.push(`${sc}.vars[${JSON.stringify(n.name)}] = ${xs}[${kk}];`);
+        parts.push(`${lp}.index = ${kk} + 1; ${lp}.first = ${kk} === 0; ${lp}.last = ${kk} === ${xs}.length - 1;`);
+        frames.push({ scopeVar: sc, names: new Set([n.name, 'loop']) });
+        emitNodes(n.body, staticDepth);
+        frames.pop();
+        parts.push(`}`);
+        parts.push(`}`);
+      } else if (n.kind === 'include') {
+        const target = templates.get(n.name);
+        if (target === undefined) {
+          // a missing template renders nothing (as in renderNodes)
+        } else if (inlining.includes(n.name)) {
+          // cycle: fall back to the interpreter for this include
+          const cur = frames[frames.length - 1].scopeVar;
+          parts.push(`{ const __t2 = ctx.templates.get(${JSON.stringify(n.name)}); if (__t2 !== undefined && depth + ${staticDepth} < 8) renderNodes(__t2, ${cur}, ctx, depth + ${staticDepth} + 1, out); }`);
+        } else if (staticDepth >= 8) {
+          // an include at depth >= 8 renders nothing (as in renderNodes)
+        } else {
+          parts.push(`if (depth + ${staticDepth} < 8) {`);
+          inlining.push(n.name);
+          emitNodes(target, staticDepth + 1);
+          inlining.pop();
+          parts.push(`}`);
+        }
+      }
+    }
+  }
+  emitNodes(nodes, 0);
+  return new Function('scope', 'ctx', 'depth', 'out', 'escInto', 'textOf', 'truthy', 'renderNodes', parts.join('\n'));
+}
+
 // ---------------------------------------------------------------- the build
 
 export const REPORT_FILE = 'build-report.txt';
@@ -755,7 +875,7 @@ export function build(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n') });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -878,7 +998,7 @@ export function build(input) {
     ...cards.get(s),
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
@@ -887,11 +1007,26 @@ export function build(input) {
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const ctx = { templates, escape: escapeHtml };
+  // Compile a template on its first render only (layouts, not every
+  // partial): compiling all of them eagerly costs more than it saves.
+  // Any compilation failure falls back to the interpreter for that name.
+  const compiled = new Map();
   const render = (name, vars) => {
-    const nodes = templates.get(name);
-    if (nodes === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    const scope = { vars: { site, tags: allTags, recent, ...vars }, parent: null };
+    let fn = compiled.get(name);
+    if (fn === undefined) {
+      const nodes = templates.get(name);
+      if (nodes === undefined) return null;
+      try {
+        fn = compileTemplate(name, nodes, templates);
+      } catch {
+        fn = null;
+      }
+      compiled.set(name, fn);
+    }
+    if (fn !== null) fn(scope, ctx, 0, out, escInto, textOf, truthy, renderNodes);
+    else renderNodes(templates.get(name), scope, ctx, 0, out);
     return out.join('');
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
